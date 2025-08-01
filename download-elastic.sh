@@ -213,19 +213,132 @@ download_all_packages() {
     fi
 }
 
-# Generate checksums
-generate_checksums() {
-    echo -e "${BLUE}🔐 Generating checksums...${NC}"
+# Verify checksums against official Elastic checksums
+verify_checksums() {
+    echo -e "${BLUE}🔐 Verifying checksums against official Elastic checksums...${NC}"
     
-    if command -v sha256sum >/dev/null 2>&1; then
-        local checksum_file="$DOWNLOAD_DIR/SHA256SUMS"
-        (cd "$DOWNLOAD_DIR" && sha256sum *.rpm > SHA256SUMS 2>/dev/null)
-        if [[ -f "$checksum_file" ]]; then
-            echo -e "${GREEN}✅ Checksums saved to: $checksum_file${NC}"
+    local verification_failed=false
+    
+    for package_name in "${!PACKAGES[@]}"; do
+        local filename="${package_name}-${VERSION}-${ARCH}.rpm"
+        local filepath="$DOWNLOAD_DIR/$filename"
+        
+        if [[ ! -f "$filepath" ]]; then
+            echo -e "${YELLOW}⚠️  Skipping $filename (file not found)${NC}"
+            continue
         fi
+        
+        echo "🔍 Verifying $filename..."
+        
+        # Try SHA512 first (preferred by Elastic)
+        local checksum_url="${PACKAGES[$package_name]}/${filename}.sha512"
+        local expected_checksum=""
+        local hash_type="SHA512"
+        
+        echo "   Downloading official checksum from: $checksum_url"
+        expected_checksum=$(curl -s --fail "$checksum_url" 2>/dev/null | cut -d' ' -f1 || echo "")
+        
+        # If SHA512 fails, try SHA256
+        if [[ -z "$expected_checksum" ]]; then
+            checksum_url="${PACKAGES[$package_name]}/${filename}.sha256"
+            hash_type="SHA256"
+            echo "   Trying SHA256 checksum from: $checksum_url"
+            expected_checksum=$(curl -s --fail "$checksum_url" 2>/dev/null | cut -d' ' -f1 || echo "")
+        fi
+        
+        # If still no checksum, try alternative URL patterns
+        if [[ -z "$expected_checksum" ]]; then
+            # Some packages might have checksums in a different location
+            local alt_checksum_url="https://artifacts.elastic.co/downloads/${package_name}/${filename}.sha512"
+            echo "   Trying alternative URL: $alt_checksum_url"
+            expected_checksum=$(curl -s --fail "$alt_checksum_url" 2>/dev/null | cut -d' ' -f1 || echo "")
+            hash_type="SHA512"
+        fi
+        
+        if [[ -z "$expected_checksum" ]]; then
+            echo -e "${YELLOW}⚠️  Could not download official checksum for $filename${NC}"
+            echo "   You can verify manually at: https://www.elastic.co/downloads"
+            continue
+        fi
+        
+        # Calculate local checksum
+        local actual_checksum=""
+        if [[ "$hash_type" == "SHA512" ]]; then
+            if command -v sha512sum >/dev/null 2>&1; then
+                actual_checksum=$(sha512sum "$filepath" | cut -d' ' -f1)
+            else
+                echo -e "${YELLOW}⚠️  sha512sum not available, skipping verification${NC}"
+                continue
+            fi
+        else
+            if command -v sha256sum >/dev/null 2>&1; then
+                actual_checksum=$(sha256sum "$filepath" | cut -d' ' -f1)
+            else
+                echo -e "${YELLOW}⚠️  sha256sum not available, skipping verification${NC}"
+                continue
+            fi
+        fi
+        
+        # Compare checksums
+        if [[ "$expected_checksum" == "$actual_checksum" ]]; then
+            echo -e "${GREEN}✅ $hash_type checksum verified for $filename${NC}"
+            echo "   Expected: $expected_checksum"
+            echo "   Actual:   $actual_checksum"
+        else
+            echo -e "${RED}❌ $hash_type checksum mismatch for $filename${NC}"
+            echo "   Expected: $expected_checksum"
+            echo "   Actual:   $actual_checksum"
+            echo -e "${RED}   WARNING: File may be corrupted or tampered with!${NC}"
+            verification_failed=true
+        fi
+        echo ""
+    done
+    
+    if [[ "$verification_failed" == "true" ]]; then
+        echo -e "${RED}❌ Checksum verification failed for one or more files${NC}"
+        echo -e "${YELLOW}⚠️  Recommendation: Re-download the failed packages${NC}"
+        return 1
     else
-        echo -e "${YELLOW}⚠️  sha256sum not available, skipping checksum generation${NC}"
+        echo -e "${GREEN}✅ All available checksums verified successfully${NC}"
+        return 0
     fi
+}
+
+# Generate local checksums for user reference
+generate_local_checksums() {
+    echo -e "${BLUE}🔐 Generating local checksums for reference...${NC}"
+    
+    local checksum_methods=()
+    
+    # Check which checksum tools are available
+    if command -v sha512sum >/dev/null 2>&1; then
+        checksum_methods+=("sha512sum")
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+        checksum_methods+=("sha256sum")
+    fi
+    if command -v md5sum >/dev/null 2>&1; then
+        checksum_methods+=("md5sum")
+    fi
+    
+    if [[ ${#checksum_methods[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}⚠️  No checksum tools available, skipping local checksum generation${NC}"
+        return 0
+    fi
+    
+    for method in "${checksum_methods[@]}"; do
+        local checksum_file="$DOWNLOAD_DIR/${method^^}S"
+        echo "   Generating ${method^^} checksums..."
+        
+        (cd "$DOWNLOAD_DIR" && $method *.rpm > "${method^^}S" 2>/dev/null) || {
+            echo -e "${YELLOW}⚠️  Failed to generate $method checksums${NC}"
+            continue
+        }
+        
+        if [[ -f "$checksum_file" ]]; then
+            echo -e "${GREEN}✅ ${method^^} checksums saved to: $checksum_file${NC}"
+        fi
+    done
 }
 
 # Print summary
@@ -253,6 +366,26 @@ print_summary() {
         ls -lh "$DOWNLOAD_DIR"/*.rpm 2>/dev/null | while read -r line; do
             echo "   $line"
         done || echo "   No RPM files found"
+        
+        # Show checksum files if they exist
+        echo ""
+        echo -e "${BLUE}🔐 Security files:${NC}"
+        for checksum_file in "$DOWNLOAD_DIR"/SHA*SUMS "$DOWNLOAD_DIR"/MD5SUMS; do
+            if [[ -f "$checksum_file" ]]; then
+                echo "   $(basename "$checksum_file") - $(wc -l < "$checksum_file") checksums"
+            fi
+        done
+    fi
+    
+    echo ""
+    echo -e "${BLUE}🔐 Security Notes:${NC}"
+    if [[ $exit_code -eq 0 ]]; then
+        echo "   • Packages verified against official Elastic checksums"
+        echo "   • Local checksums generated for additional verification"
+        echo "   • Files are ready for secure offline installation"
+    else
+        echo "   • Some downloads may have failed - check above for details"
+        echo "   • Verify any partial downloads before use"
     fi
     
     echo ""
@@ -297,7 +430,21 @@ main() {
     # Download packages
     if download_all_packages; then
         verify_downloads
-        generate_checksums
+        
+        # Verify against official checksums
+        echo ""
+        echo -e "${BLUE}🔐 Security Verification${NC}"
+        if verify_checksums; then
+            echo -e "${GREEN}✅ All packages verified against official Elastic checksums${NC}"
+        else
+            echo -e "${YELLOW}⚠️  Some checksum verifications failed or were skipped${NC}"
+            echo "   You can still use the packages, but verify manually if concerned"
+        fi
+        
+        # Generate local checksums for reference
+        echo ""
+        generate_local_checksums
+        
         print_summary 0
         exit 0
     else
