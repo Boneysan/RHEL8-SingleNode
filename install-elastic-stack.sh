@@ -833,7 +833,7 @@ SEARCH_RESULT=$(curl -s -k -u "$ES_USER:$ES_PASS" \
     "https://$ES_HOST:$ES_PORT/filebeat-*/_search" \
     -H "Content-Type: application/json" \
     -d '{"query":{"match":{"message":"Filebeat test message"}}}' \
-    2>/dev/null | grep -o '"total":{"value":[0-9]*' | grep -o '[0-9]* || echo "0")
+    2>/dev/null | grep -o '"total":{"value":[0-9]*' | grep -o '[0-9]*$' || echo "0")
 
 if [[ "$SEARCH_RESULT" -gt 0 ]]; then
     echo -e "${GREEN}✅ Test log successfully indexed in Elasticsearch${NC}"
